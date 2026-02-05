@@ -1,0 +1,252 @@
+--block_score ≈ Σ (demand_share × supply_share) for blocked pairs.
+
+
+
+-- Block Impact Scoring (public template)
+-- Goal: estimate how much supply-demand opportunity is affected by block rules,
+-- using revenue-weighted "size" proxies for demand entities and supply entities.
+
+DECLARE run_date DATE DEFAULT @run_date;
+
+-- =========================
+-- 1) Base traffic (observed)
+-- =========================
+WITH traffic AS (
+  SELECT
+    DATE(event_date)                         AS event_date,
+    country_code                             AS country,
+    advertiser_id                            AS advertiser_id,
+    line_item_id                             AS line_item_id,
+    site_id                                  AS site_id,
+    placement_id                             AS placement_id,
+    SUM(gross_revenue)                       AS revenue,
+    SUM(net_revenue_or_margin)               AS margin  -- optional
+  FROM `{{PROJECT}}.{{DATASET}}.traffic_daily`
+  WHERE DATE(event_date) = DATE_SUB(run_date, INTERVAL 1 DAY)
+    AND country_code IN ('IL','US','FR','DE','GB','JP')
+    AND gross_revenue > 0
+  GROUP BY 1,2,3,4,5,6
+),
+
+-- Optional: keep only entities above a minimum revenue to control scale
+top_advertisers AS (
+  SELECT
+    advertiser_id,
+    event_date,
+    country,
+    SUM(revenue) AS advertiser_revenue
+  FROM traffic
+  GROUP BY 1,2,3
+  HAVING SUM(revenue) >= 1
+),
+
+top_sites AS (
+  SELECT
+    site_id,
+    event_date,
+    country,
+    SUM(revenue) AS site_revenue
+  FROM traffic
+  GROUP BY 1,2,3
+  HAVING SUM(revenue) >= 1
+),
+
+filtered_traffic AS (
+  SELECT t.*
+  FROM traffic t
+  JOIN top_advertisers a
+    ON a.advertiser_id = t.advertiser_id
+   AND a.event_date    = t.event_date
+   AND a.country       = t.country
+  JOIN top_sites s
+    ON s.site_id       = t.site_id
+   AND s.event_date    = t.event_date
+   AND s.country       = t.country
+),
+
+-- =========================
+-- 2) Supply size (share)
+-- =========================
+supply AS (
+  SELECT
+    event_date,
+    country,
+    site_id,
+    placement_id,
+    SUM(revenue) AS placement_revenue,
+    SUM(SUM(revenue)) OVER (PARTITION BY event_date, country, site_id) AS site_revenue,
+    SAFE_DIVIDE(
+      SUM(revenue),
+      SUM(SUM(revenue)) OVER (PARTITION BY event_date, country, site_id)
+    ) AS placement_share
+  FROM filtered_traffic
+  GROUP BY 1,2,3,4
+),
+
+-- =========================
+-- 3) Demand size (share)
+-- =========================
+demand AS (
+  SELECT
+    event_date,
+    country,
+    advertiser_id,
+    line_item_id,
+    SUM(revenue) AS line_item_revenue,
+    SUM(SUM(revenue)) OVER (PARTITION BY event_date, country, advertiser_id) AS advertiser_revenue,
+    SAFE_DIVIDE(
+      SUM(revenue),
+      SUM(SUM(revenue)) OVER (PARTITION BY event_date, country, advertiser_id)
+    ) AS line_item_share
+  FROM filtered_traffic
+  GROUP BY 1,2,3,4
+),
+
+-- ==========================================================
+-- 4) Potential exposure matrix (independence approximation!)
+-- ==========================================================
+potential AS (
+  SELECT
+    s.event_date,
+    s.country,
+    s.site_id,
+    s.placement_id,
+    s.placement_share,
+    d.advertiser_id,
+    d.line_item_id,
+    d.line_item_share,
+    (s.placement_share * d.line_item_share) AS potential_weight
+  FROM supply s
+  JOIN demand d
+    ON d.event_date = s.event_date
+   AND d.country    = s.country
+),
+
+-- =========================
+-- 5) Block rules (generic)
+-- =========================
+-- Expected schema for block_rules:
+-- - advertiser_id
+-- - line_item_id (nullable)
+-- - site_id
+-- - placement_id (nullable)
+-- - block_scope ENUM-like string:
+--     'LINE_ITEM_PLACEMENT', 'LINE_ITEM_SITE', 'ADVERTISER_PLACEMENT', 'ADVERTISER_SITE'
+-- - created_date, removed_date (nullable)
+
+block_rules_dedup AS (
+  SELECT
+    advertiser_id,
+    line_item_id,
+    site_id,
+    placement_id,
+    block_scope,
+    DATE(created_date) AS created_date,
+    DATE(removed_date) AS removed_date
+  FROM `{{PROJECT}}.{{DATASET}}.block_rules`
+  WHERE DATE(created_date) < run_date
+    AND (removed_date IS NULL OR DATE(removed_date) > DATE(created_date))
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY advertiser_id, line_item_id, site_id, placement_id, block_scope
+    ORDER BY created_date DESC
+  ) = 1
+),
+
+active_blocks AS (
+  -- Expand to the scoring date (yesterday)
+  SELECT
+    DATE_SUB(run_date, INTERVAL 1 DAY) AS event_date,
+    b.*,
+    DATE_DIFF(COALESCE(b.removed_date, DATE_SUB(run_date, INTERVAL 1 DAY)), b.created_date, DAY) AS block_age_days
+  FROM block_rules_dedup b
+  WHERE DATE_SUB(run_date, INTERVAL 1 DAY) >= b.created_date
+    AND DATE_SUB(run_date, INTERVAL 1 DAY) < COALESCE(b.removed_date, DATE '2048-05-14')
+),
+
+-- Precedence (configurable)
+blocks_scored AS (
+  SELECT
+    *,
+    CASE block_scope
+      WHEN 'LINE_ITEM_PLACEMENT'   THEN 1
+      WHEN 'LINE_ITEM_SITE'        THEN 2
+      WHEN 'ADVERTISER_PLACEMENT'  THEN 3
+      WHEN 'ADVERTISER_SITE'       THEN 4
+      ELSE 99
+    END AS scope_rank
+  FROM active_blocks
+),
+
+-- =========================
+-- 6) Join blocks to potential
+-- =========================
+labeled AS (
+  SELECT
+    p.*,
+
+    -- Match the 4 block scopes
+    MAX(IF(b.block_scope = 'LINE_ITEM_PLACEMENT', 1, 0)) AS li_placement_block,
+    MAX(IF(b.block_scope = 'LINE_ITEM_SITE',      1, 0)) AS li_site_block,
+    MAX(IF(b.block_scope = 'ADVERTISER_PLACEMENT',1, 0)) AS adv_placement_block,
+    MAX(IF(b.block_scope = 'ADVERTISER_SITE',     1, 0)) AS adv_site_block,
+
+    -- A simple "any block"
+    MAX(1) AS any_block, -- will be null if no join; fixed below
+
+    -- Choose the most specific/strongest active block for age (lowest rank wins)
+    MIN_BY(b.block_age_days, b.scope_rank) AS chosen_block_age_days
+
+  FROM potential p
+  LEFT JOIN blocks_scored b
+    ON b.event_date     = p.event_date
+   AND b.advertiser_id  = p.advertiser_id
+   AND (b.line_item_id  IS NULL OR b.line_item_id = p.line_item_id)
+   AND b.site_id        = p.site_id
+   AND (b.placement_id  IS NULL OR b.placement_id = p.placement_id)
+
+  GROUP BY
+    p.event_date, p.country, p.site_id, p.placement_id, p.placement_share,
+    p.advertiser_id, p.line_item_id, p.line_item_share, p.potential_weight
+),
+
+final_labeled AS (
+  SELECT
+    *,
+    IFNULL(li_placement_block, 0) AS li_placement_block,
+    IFNULL(li_site_block,      0) AS li_site_block,
+    IFNULL(adv_placement_block,0) AS adv_placement_block,
+    IFNULL(adv_site_block,     0) AS adv_site_block,
+    IFNULL(any_block,          0) AS any_block
+  FROM labeled
+),
+
+-- =========================
+-- 7) Aggregate: block impact
+-- =========================
+agg AS (
+  SELECT
+    event_date,
+    country,
+    site_id,
+    advertiser_id,
+
+    -- overall score: share of potential opportunity impacted by any block
+    SUM(IF(any_block = 1, potential_weight, 0)) AS block_score,
+
+    -- by type
+    SUM(IF(li_placement_block = 1, potential_weight, 0)) AS block_score_li_placement,
+    SUM(IF(li_site_block      = 1, potential_weight, 0)) AS block_score_li_site,
+    SUM(IF(adv_placement_block= 1, potential_weight, 0)) AS block_score_adv_placement,
+    SUM(IF(adv_site_block     = 1, potential_weight, 0)) AS block_score_adv_site,
+
+    -- share-weighted average age among blocked opportunity
+    SAFE_DIVIDE(
+      SUM(IF(any_block = 1, potential_weight * chosen_block_age_days, 0)),
+      SUM(IF(any_block = 1, potential_weight, 0))
+    ) AS avg_block_age_days
+
+  FROM final_labeled
+  GROUP BY 1,2,3,4
+)
+
+SELECT * FROM agg;
