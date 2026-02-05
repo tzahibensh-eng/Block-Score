@@ -6,6 +6,8 @@
 -- Goal: estimate how much supply-demand opportunity is affected by block rules,
 -- using revenue-weighted "size" proxies for demand entities and supply entities.
 
+Data anonymization: The SQL code in this repository is based on a real production implementation, but: Table names, column names, and identifiers have been intentionally changed.
+
 DECLARE run_date DATE DEFAULT @run_date;
 
 -- =========================
@@ -21,7 +23,7 @@ WITH traffic AS (
     placement_id                             AS placement_id,
     SUM(gross_revenue)                       AS revenue,
     SUM(net_revenue_or_margin)               AS margin  -- optional
-  FROM `{{PROJECT}}.{{DATASET}}.traffic_daily`
+  FROM traffic_daily
   WHERE DATE(event_date) = DATE_SUB(run_date, INTERVAL 1 DAY)
     AND country_code IN ('IL','US','FR','DE','GB','JP')
     AND gross_revenue > 0
@@ -143,7 +145,7 @@ block_rules_dedup AS (
     block_scope,
     DATE(created_date) AS created_date,
     DATE(removed_date) AS removed_date
-  FROM `{{PROJECT}}.{{DATASET}}.block_rules`
+  FROM block_rules
   WHERE DATE(created_date) < run_date
     AND (removed_date IS NULL OR DATE(removed_date) > DATE(created_date))
   QUALIFY ROW_NUMBER() OVER (
